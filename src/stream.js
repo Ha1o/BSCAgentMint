@@ -66,22 +66,6 @@ export class MintgoStream extends EventEmitter {
     this.ws = ws;
     this.lastMsgAt = Date.now();
 
-    ws.on("open", () => {
-      this.backoff = 0;
-      log.info("stream", "已连接，等待事件");
-      this.pingTimer = setInterval(() => {
-        try {
-          ws.ping();
-        } catch {}
-      }, 30_000);
-      this.watchTimer = setInterval(() => {
-        if (Date.now() - this.lastMsgAt > 180_000) {
-          log.warn("stream", "3 分钟无消息，强制重连");
-          ws.terminate();
-        }
-      }, 30_000);
-    });
-
     ws.on("message", (raw) => {
       this.lastMsgAt = Date.now();
       let msg;
@@ -120,14 +104,35 @@ export class MintgoStream extends EventEmitter {
       }, 30_000);
       this.watchTimer = setInterval(() => {
         if (Date.now() - this.lastMsgAt > 180_000) {
-          log.warn("stream", "3 分钟无消息，强制重连");
-          ws.terminate();
+          log.warn("stream", "3 分钟无消息，优雅关闭后重连（让服务端尽快释放连接配额）");
+          try {
+            ws.close();
+          } catch {}
+          setTimeout(() => {
+            try {
+              ws.terminate();
+            } catch {}
+          }, 5000);
         }
       }, 30_000);
     });
 
     ws.on("pong", () => {
       this.lastMsgAt = Date.now();
+    });
+
+    ws.on("unexpected-response", (req, res) => {
+      let body = "";
+      res.on("data", (c) => (body += c));
+      res.on("end", () => {
+        const h = res.headers || {};
+        const rlHeaders = Object.fromEntries(Object.entries(h).filter(([k]) => /rate|limit|retry/i.test(k)));
+        log.error(
+          "stream",
+          `握手被拒 status=${res.statusCode} server=${h.server || "?"} cf-ray=${h["cf-ray"] || "-"} 限流头=${JSON.stringify(rlHeaders)} body=${body.slice(0, 200)}`
+        );
+        if (res.statusCode === 429) this.rateLimited = true;
+      });
     });
 
     ws.on("error", (e) => {
@@ -157,8 +162,8 @@ export class MintgoStream extends EventEmitter {
 
   delay() {
     if (this.rateLimited) {
-      // 被限流：2 分钟起步，翻倍到 10 分钟封顶
-      return Math.min(600_000, 120_000 * 2 ** Math.min(this.backoff, 3)) + Math.floor(Math.random() * 5000);
+      // 429/CONNECTION_LIMIT：等旧连接在服务端释放，60s 起步、5min 封顶
+      return Math.min(300_000, 60_000 * 2 ** Math.min(this.backoff, 3)) + Math.floor(Math.random() * 5000);
     }
     return Math.min(60_000, 1000 * 2 ** this.backoff) + Math.floor(Math.random() * 800);
   }

@@ -261,6 +261,38 @@ def diag(cli):
     safe_print(run(cli, f"cd {REMOTE_DIR} && node -e \"const d=require('/home/dan/bscagentmint/data/state.json');console.log('cursor='+d.cursor,'day='+d.day,'mintedToday='+d.mintedToday,'attempts='+Object.keys(d.attempts).length); const ks=Object.entries(d.attempts).sort((a,b)=>a[1].at<b[1].at?-1:1).slice(-5); ks.forEach(([k,v])=>console.log(v.at,v.status,k))\" 2>&1 || tail -c 600 data/state.json"))
 
 
+def resignin(cli):
+    """强制重签：先登出（清掉会话文件），再走扫码流程。登出到扫码完成之间服务只通知不打。"""
+    run(cli, "docker rm -f baw-signin 2>/dev/null; true")
+    out = run(cli, f"cd {REMOTE_DIR} && docker compose run --rm bscagentmint node /app/node_modules/@binance/agentic-wallet/dist/index.js auth signout --json 2>&1 | tail -1")
+    safe_print("signout: " + out.strip()[:200])
+    signin(cli)
+
+
+def logs429(cli):
+    out = run(cli, f"grep -n '429' {REMOTE_DIR}/logs/app.log | tail -80")
+    lines = [l for l in out.splitlines() if l.strip()]
+    safe_print(f"429 相关日志行数（最近80条显示）: {len(lines)}")
+    if lines:
+        safe_print(f"第一条: {lines[0]}")
+        safe_print(f"最后一条: {lines[-1]}")
+        safe_print("== 原始片段 ==")
+        for l in lines[:40]:
+            safe_print(l)
+    # 容器 stdout 侧带 docker 时间戳的对照
+    safe_print("== docker logs (timestamps) ==")
+    safe_print(run(cli, f"cd {REMOTE_DIR} && docker compose logs --timestamps 2>&1 | grep -i '429' | tail -30"))
+
+
+def runfile(cli, local_path):
+    sftp = cli.open_sftp()
+    name = os.path.basename(local_path)
+    # 传到可写的家目录，运行时以单文件卷挂进容器 /app/data/（data 目录本身 root 属主不可写）
+    sftp.put(local_path, f"{REMOTE_DIR}/{name}")
+    sftp.close()
+    safe_print(run(cli, f"cd {REMOTE_DIR} && docker compose run --rm -v {REMOTE_DIR}/{name}:/app/data/{name}:ro bscagentmint node data/{name} 2>&1 | sed 's/\\x1b\\[[0-9;]*m//g' | tail -40", timeout=180))
+
+
 def restartsvc(cli):
     safe_print(run(cli, f"cd {REMOTE_DIR} && docker compose restart"))
 
@@ -288,6 +320,12 @@ if __name__ == "__main__":
             fails(cli)
         elif action == "diag":
             diag(cli)
+        elif action == "resignin":
+            resignin(cli)
+        elif action == "logs429":
+            logs429(cli)
+        elif action == "runfile":
+            runfile(cli, sys.argv[2])
         elif action == "restartsvc":
             restartsvc(cli)
         elif action == "restart":
