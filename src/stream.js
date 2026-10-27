@@ -127,20 +127,26 @@ export class MintgoStream extends EventEmitter {
       res.on("end", () => {
         const h = res.headers || {};
         const rlHeaders = Object.fromEntries(Object.entries(h).filter(([k]) => /rate|limit|retry/i.test(k)));
-        log.error(
+        log.warn(
           "stream",
           `握手被拒 status=${res.statusCode} server=${h.server || "?"} cf-ray=${h["cf-ray"] || "-"} 限流头=${JSON.stringify(rlHeaders)} body=${body.slice(0, 200)}`
         );
-        if (res.statusCode === 429) this.rateLimited = true;
+        if (res.statusCode === 429) {
+          this.rateLimited = true;
+        }
+        // 别 res.destroy() — ws 在握手拒绝后会自动 emit error+close，
+        // 手动销毁会打乱事件循环导致 ExitCode=0 异常退出；交给 error/close 完成退避
       });
     });
 
     ws.on("error", (e) => {
       if (/429/.test(e.message)) {
         this.rateLimited = true;
-        log.warn("stream", "服务端限流（429），重连间隔将加长");
+        log.warn("stream", "服务端限流（429），进入长退避等待");
+      } else {
+        log.error("stream", `WS 异常: ${e.message}`);
       }
-      log.error("stream", `错误: ${e.message}`);
+      // 吞掉错误，防止未捕获异常导致整个 Node 进程崩溃退出
     });
 
     ws.on("close", (code, reason) => {
