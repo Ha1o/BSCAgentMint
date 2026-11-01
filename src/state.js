@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
+import { log } from "./logger.js";
 
 const DATA_DIR = path.resolve("data");
 const STATE_FILE = path.join(DATA_DIR, "state.json");
@@ -13,10 +14,13 @@ const DEFAULT_STATE = {
   cursor: 0,
   seenEventIds: [],
   attempts: {}, // eventId -> { status, txHash?, reason?, at }
+  mintedContracts: {}, // contract -> { name, at }  所有成功 mint 过的合约（价值跟踪用）
   day: "",
   mintedToday: 0,
   keyExpiryWarnedOn: "",
   lastDigestOn: "",
+  lastValueReportOn: "",
+  valuePrev: {}, // 上次价值扫描的 { contract: t6h }，供报告做环比
 };
 
 fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -76,8 +80,38 @@ export const store = {
         if (state.attempts[k].at < cutoff) delete state.attempts[k];
       }
     }
-    if (status === "minted") this.bumpDaily();
+    if (status === "minted") {
+      this.bumpDaily();
+      if (contract) this.markMinted(contract, "");
+    }
     save();
+  },
+  /** 记录/更新成功 mint 过的合约（价值跟踪名单） */
+  markMinted(contract, name = "") {
+    if (!contract) return;
+    const key = contract.toLowerCase();
+    const prev = state.mintedContracts[key];
+    if (prev && prev.name) return; // 已有名字不覆盖
+    state.mintedContracts[key] = { name: name || (prev && prev.name) || "?", at: (prev && prev.at) || new Date().toISOString() };
+    save();
+  },
+  /** 历史种子：启动时从文件合并一次 */
+  seedMinted(entries) {
+    let added = 0;
+    for (const { contract, name, at } of entries) {
+      const key = String(contract).toLowerCase();
+      if (!/^0x[0-9a-f]{40}$/.test(key) || state.mintedContracts[key]) continue;
+      state.mintedContracts[key] = { name: name || "?", at: at || "" };
+      added++;
+    }
+    if (added) {
+      save();
+      log.info("state", `价值跟踪名单补充 ${added} 个历史合约，共 ${Object.keys(state.mintedContracts).length}`);
+    }
+    return added;
+  },
+  mintedCount() {
+    return Object.keys(state.mintedContracts).length;
   },
   /** 统计最近 hours 小时的 attempts，供每日摘要使用 */
   attemptsStats(hours = 24) {
@@ -104,6 +138,14 @@ export const store = {
     state.lastDigestOn = bjDay;
     save();
     return true;
+  },
+  markValueReport(bjDay) {
+    state.lastValueReportOn = bjDay;
+    save();
+  },
+  saveValuePrev(map) {
+    state.valuePrev = map;
+    save();
   },
   dailyAllowance(maxPerDay) {
     const today = new Date().toISOString().slice(0, 10);

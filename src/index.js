@@ -7,6 +7,7 @@ import { handleEvent, setWalletState } from "./minter.js";
 import { notify, telegramEnabled } from "./telegram.js";
 import { wallet } from "./baw.js";
 import { maybeDailyDigest } from "./digest.js";
+import { maybeNightlyValueReport, seedFromTsv } from "./nftvalue.js";
 
 const maskKey = (k) => (k.length > 24 ? k.slice(0, 12) + "…" + k.slice(-6) : "…");
 
@@ -75,6 +76,15 @@ async function main() {
     } catch (e) {
       log.warn("digest", `摘要推送失败: ${e.message}`);
     }
+  }, 60_000);
+
+  // 价值跟踪：每晚 21:00-21:05 推送 NFT 活跃度报告；启动时合并历史 minted 合约清单
+  try {
+    const seeded = seedFromTsv("data/minted-seed.tsv");
+    if (seeded) log.info("boot", `价值跟踪: 合并历史合约 ${seeded} 个`);
+  } catch {}
+  setInterval(() => {
+    maybeNightlyValueReport().catch((e) => log.warn("nftvalue", `定时报告失败: ${e.message}`));
   }, 60_000);
 
   stream.start();

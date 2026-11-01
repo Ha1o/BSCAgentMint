@@ -32,7 +32,7 @@ UPLOAD_FILES = [
     "probe-stream.mjs",
     "src/config.js", "src/logger.js", "src/proxy.js", "src/state.js", "src/rpc.js",
     "src/stream.js", "src/classify.js", "src/baw.js", "src/minter.js", "src/telegram.js",
-    "src/index.js", "src/digest.js",
+    "src/index.js", "src/digest.js", "src/nftvalue.js",
     "scripts/signin.mjs", "scripts/test-telegram.mjs", "scripts/test-classify.mjs",
 ]
 
@@ -289,8 +289,14 @@ def runfile(cli, local_path):
     name = os.path.basename(local_path)
     # 传到可写的家目录，运行时以单文件卷挂进容器 /app/data/（data 目录本身 root 属主不可写）
     sftp.put(local_path, f"{REMOTE_DIR}/{name}")
+    # 顺带同步数据文件（如 minted-list.tsv），供脚本读取
+    data_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data")
+    if os.path.isdir(data_dir):
+        for f in os.listdir(data_dir):
+            if f.endswith(".tsv"):
+                sftp.put(os.path.join(data_dir, f), f"{REMOTE_DIR}/{f}")
     sftp.close()
-    safe_print(run(cli, f"cd {REMOTE_DIR} && docker compose run --rm -v {REMOTE_DIR}/{name}:/app/data/{name}:ro bscagentmint node data/{name} 2>&1 | sed 's/\\x1b\\[[0-9;]*m//g' | tail -40", timeout=180))
+    safe_print(run(cli, f"cd {REMOTE_DIR} && docker compose run --rm -e NODE_USE_ENV_PROXY=1 -e HTTPS_PROXY={NAS_PROXY_URL} -e HTTP_PROXY={NAS_PROXY_URL} -e NO_PROXY=localhost,127.0.0.1 -v {REMOTE_DIR}/{name}:/app/data/{name}:ro -v {REMOTE_DIR}/minted-list.tsv:/app/data/minted-list.tsv:ro -w /app bscagentmint node data/{name} 2>&1 | sed 's/\\x1b\\[[0-9;]*m//g' | tail -50", timeout=1500))
 
 
 def loginstatus(cli):
@@ -342,6 +348,39 @@ def stats(cli, hours=24):
     safe_print(f"今日计数: mintedToday={d.get('mintedToday')} day={d.get('day')}")
 
 
+def mintedlist(cli):
+    """从 NAS 日志提取所有自动 mint 成功的合约清单，拉回本地 data/minted-contracts.txt"""
+    out = run(cli, "cat /home/dan/bscagentmint/logs/app.log 2>/dev/null | grep -A3 '自动 mint 已提交' | grep -oP '0x[0-9a-fA-F]{40}' | sort -u | wc -l")
+    safe_print("app.log 去重合约数: " + out.strip())
+    run(cli, "cat /home/dan/bscagentmint/logs/app.log 2>/dev/null | grep -A3 '自动 mint 已提交' | grep -B1 -oP '0x[0-9a-fA-F]{40}' > /tmp/minted-raw.txt; true")
+    # 带项目名：取 "项目: NAME" 与其后的合约行成对
+    run(cli, "python3 - <<'EOF' > /tmp/minted-list.txt\nimport re\nimport sys\ntext = open('/home/dan/bscagentmint/logs/app.log', encoding='utf-8', errors='replace').read()\nblocks = text.split('自动 mint 已提交')[1:]\nseen = {}\nfor b in blocks:\n    m = re.search(r'项目: (.+)', b)\n    c = re.search(r'合约: (0x[0-9a-fA-F]{40})', b)\n    tx = re.search(r'交易: (0x[0-9a-fA-F]{64})', b)\n    if c:\n        seen.setdefault(c.group(1), (m.group(1).strip() if m else '?', tx.group(1) if tx else ''))\nfor c, (n, t) in seen.items():\n    print(f'{c}\\t{n}\\t{t}')\nEOF")
+    sftp = cli.open_sftp()
+    local = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "minted-list.tsv")
+    try:
+        sftp.get("/tmp/minted-list.txt", local)
+    finally:
+        sftp.close()
+    safe_print("已拉回 " + local)
+    with open(local, encoding="utf-8") as f:
+        lines = f.read().strip().splitlines()
+    safe_print(f"共 {len(lines)} 个合约")
+
+
+def seedfile(cli):
+    """把本地 data/minted-seed.tsv 传到 NAS 容器的 data/ 里（root 属主，需 sudo/docker cp）"""
+    sftp = cli.open_sftp()
+    sftp.put(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "minted-seed.tsv"), f"{REMOTE_DIR}/minted-seed.tsv")
+    sftp.close()
+    safe_print(run(cli, f"docker cp {REMOTE_DIR}/minted-seed.tsv bscagentmint:/app/data/minted-seed.tsv && docker exec bscagentmint wc -l /app/data/minted-seed.tsv", timeout=60))
+
+
+def testreport(cli):
+    """手动触发一次价值扫描并推 Telegram（约 10-20 分钟）"""
+    code = "import('./src/nftvalue.js').then(m=>m.runValueReportNow(true)).then(n=>{console.log('PUSHED_ROWS='+n);process.exit(0)}).catch(e=>{console.error('FAIL '+e.message);process.exit(1)})"
+    safe_print(run(cli, f'docker exec -w /app bscagentmint node -e "{code}"', timeout=1500))
+
+
 def restartsvc(cli):
     safe_print(run(cli, f"cd {REMOTE_DIR} && docker compose restart"))
 
@@ -377,6 +416,12 @@ if __name__ == "__main__":
             runfile(cli, sys.argv[2])
         elif action == "stats":
             stats(cli, int(sys.argv[2]) if len(sys.argv) > 2 else 24)
+        elif action == "mintedlist":
+            mintedlist(cli)
+        elif action == "seedfile":
+            seedfile(cli)
+        elif action == "testreport":
+            testreport(cli)
         elif action == "loginstatus":
             loginstatus(cli)
             restartsvc(cli)

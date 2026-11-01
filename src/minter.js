@@ -13,6 +13,10 @@ export function setWalletState(s) {
   walletState = { ...walletState, ...s };
 }
 
+export function getWalletAddress() {
+  return walletState.connected ? walletState.address : null;
+}
+
 /** baw 会话失效类错误（掉线/未登录/服务端异常） */
 function isBawAuthError(msg) {
   return /NOT_LOGGED_IN|10003000|System abnormality|UNAUTHORIZED|LOGGED_OUT/i.test(String(msg));
