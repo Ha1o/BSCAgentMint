@@ -32,7 +32,7 @@ UPLOAD_FILES = [
     "probe-stream.mjs",
     "src/config.js", "src/logger.js", "src/proxy.js", "src/state.js", "src/rpc.js",
     "src/stream.js", "src/classify.js", "src/baw.js", "src/minter.js", "src/telegram.js",
-    "src/index.js",
+    "src/index.js", "src/digest.js",
     "scripts/signin.mjs", "scripts/test-telegram.mjs", "scripts/test-classify.mjs",
 ]
 
@@ -293,6 +293,55 @@ def runfile(cli, local_path):
     safe_print(run(cli, f"cd {REMOTE_DIR} && docker compose run --rm -v {REMOTE_DIR}/{name}:/app/data/{name}:ro bscagentmint node data/{name} 2>&1 | sed 's/\\x1b\\[[0-9;]*m//g' | tail -40", timeout=180))
 
 
+def loginstatus(cli):
+    safe_print("SIGNIN:")
+    safe_print(run(cli, "docker logs baw-signin 2>&1 | tail -14"))
+    safe_print("MAIN:")
+    safe_print(run(cli, 'docker inspect bscagentmint --format "RestartCount={{.RestartCount}} Status={{.State.Status}} StartedAt={{.State.StartedAt}}"'))
+
+
+def stats(cli, hours=24):
+    sftp = cli.open_sftp()
+    tmp = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "nas-state.json")
+    try:
+        sftp.get(f"{REMOTE_DIR}/data/state.json", tmp)
+    finally:
+        sftp.close()
+    d = json.load(open(tmp, encoding="utf-8"))
+    cutoff = time.time() * 1000 - hours * 3600 * 1000
+    from collections import Counter
+    buckets = Counter()
+    failed_reasons = Counter()
+    minted = 0
+    total = 0
+    for k, v in d.get("attempts", {}).items():
+        at = v.get("at")
+        try:
+            ts = time.mktime(time.strptime(at[:19], "%Y-%m-%dT%H:%M:%S")) * 1000
+        except Exception:
+            continue
+        if ts < cutoff:
+            continue
+        total += 1
+        st = v.get("status", "?")
+        buckets[st] += 1
+        if st == "minted":
+            minted += 1
+        elif st == "mint-failed":
+            r = (v.get("reason") or "")[:300]
+            failed_reasons[r] += 1
+    safe_print(f"== 过去 {hours} 小时 ==")
+    safe_print(f"事件处理总数: {total}")
+    for st, n in buckets.most_common():
+        safe_print(f"  {st}: {n}")
+    safe_print(f"已 mint: {minted}  未 mint: {total - minted}")
+    if failed_reasons:
+        safe_print("== mint-failed 原因分布 ==")
+        for r, n in failed_reasons.most_common(6):
+            safe_print(f"  {n}x {r}")
+    safe_print(f"今日计数: mintedToday={d.get('mintedToday')} day={d.get('day')}")
+
+
 def restartsvc(cli):
     safe_print(run(cli, f"cd {REMOTE_DIR} && docker compose restart"))
 
@@ -326,7 +375,10 @@ if __name__ == "__main__":
             logs429(cli)
         elif action == "runfile":
             runfile(cli, sys.argv[2])
-        elif action == "restartsvc":
+        elif action == "stats":
+            stats(cli, int(sys.argv[2]) if len(sys.argv) > 2 else 24)
+        elif action == "loginstatus":
+            loginstatus(cli)
             restartsvc(cli)
         elif action == "restart":
             safe_print(run(cli, f"cd {REMOTE_DIR} && docker compose up -d --build"))

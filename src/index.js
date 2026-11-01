@@ -6,6 +6,7 @@ import { MintgoStream } from "./stream.js";
 import { handleEvent, setWalletState } from "./minter.js";
 import { notify, telegramEnabled } from "./telegram.js";
 import { wallet } from "./baw.js";
+import { maybeDailyDigest } from "./digest.js";
 
 const maskKey = (k) => (k.length > 24 ? k.slice(0, 12) + "…" + k.slice(-6) : "…");
 
@@ -66,6 +67,15 @@ async function main() {
   };
   process.on("SIGINT", shutdown);
   process.on("SIGTERM", shutdown);
+
+  // 每日摘要：北京时间 08:00-08:05 窗口内推送过去 24 小时统计
+  setInterval(() => {
+    try {
+      maybeDailyDigest();
+    } catch (e) {
+      log.warn("digest", `摘要推送失败: ${e.message}`);
+    }
+  }, 60_000);
 
   stream.start();
 }

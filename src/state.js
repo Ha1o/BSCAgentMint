@@ -6,7 +6,8 @@ const STATE_FILE = path.join(DATA_DIR, "state.json");
 const EVENTS_FILE = path.join(DATA_DIR, "events.jsonl");
 
 const SEEN_CAP = 1000;
-const ATTEMPT_CAP = 2000;
+const ATTEMPT_CAP = 4000; // 超过后按时间修剪（保留 48h），保证 24h 摘要数据完整
+const ATTEMPT_TTL = 48 * 3600_000;
 
 const DEFAULT_STATE = {
   cursor: 0,
@@ -15,6 +16,7 @@ const DEFAULT_STATE = {
   day: "",
   mintedToday: 0,
   keyExpiryWarnedOn: "",
+  lastDigestOn: "",
 };
 
 fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -69,10 +71,39 @@ export const store = {
     };
     const keys = Object.keys(state.attempts);
     if (keys.length > ATTEMPT_CAP) {
-      for (const k of keys.slice(0, keys.length - ATTEMPT_CAP)) delete state.attempts[k];
+      const cutoff = new Date(Date.now() - ATTEMPT_TTL).toISOString();
+      for (const k of keys) {
+        if (state.attempts[k].at < cutoff) delete state.attempts[k];
+      }
     }
     if (status === "minted") this.bumpDaily();
     save();
+  },
+  /** 统计最近 hours 小时的 attempts，供每日摘要使用 */
+  attemptsStats(hours = 24) {
+    const cutoff = new Date(Date.now() - hours * 3600_000).toISOString();
+    const byStatus = {};
+    const failedReasons = {};
+    let total = 0;
+    let minted = 0;
+    for (const v of Object.values(state.attempts)) {
+      if (!v.at || v.at < cutoff) continue;
+      total += 1;
+      byStatus[v.status] = (byStatus[v.status] || 0) + 1;
+      if (v.status === "minted") minted += 1;
+      if (v.status === "mint-failed") {
+        const r = String(v.reason || "unknown");
+        failedReasons[r] = (failedReasons[r] || 0) + 1;
+      }
+    }
+    return { total, minted, byStatus, failedReasons };
+  },
+  /** 每日摘要每天最多发一次（北京时间日界） */
+  shouldSendDigest(bjDay) {
+    if (state.lastDigestOn === bjDay) return false;
+    state.lastDigestOn = bjDay;
+    save();
+    return true;
   },
   dailyAllowance(maxPerDay) {
     const today = new Date().toISOString().slice(0, 10);

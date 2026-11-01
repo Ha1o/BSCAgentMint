@@ -123,20 +123,18 @@ export class MintgoStream extends EventEmitter {
 
     ws.on("unexpected-response", (req, res) => {
       let body = "";
-      res.on("data", (c) => (body += c));
-      res.on("end", () => {
+      if (res.statusCode === 429) this.rateLimited = true;
+      const timeout = setTimeout(() => ws.terminate(), 5000);
+      res.on("data", (chunk) => { if (body.length < 1024) body += chunk.toString().slice(0, 1024 - body.length); });
+      const finish = () => {
+        clearTimeout(timeout);
         const h = res.headers || {};
         const rlHeaders = Object.fromEntries(Object.entries(h).filter(([k]) => /rate|limit|retry/i.test(k)));
-        log.warn(
-          "stream",
-          `握手被拒 status=${res.statusCode} server=${h.server || "?"} cf-ray=${h["cf-ray"] || "-"} 限流头=${JSON.stringify(rlHeaders)} body=${body.slice(0, 200)}`
-        );
-        if (res.statusCode === 429) {
-          this.rateLimited = true;
-        }
-        // 别 res.destroy() — ws 在握手拒绝后会自动 emit error+close，
-        // 手动销毁会打乱事件循环导致 ExitCode=0 异常退出；交给 error/close 完成退避
-      });
+        log.warn("stream", `握手被拒 status=${res.statusCode} server=${h.server || "?"} cf-ray=${h["cf-ray"] || "-"} 限流头=${JSON.stringify(rlHeaders)} body=${body.slice(0, 200)}`);
+        ws.terminate();
+      };
+      res.once("end", finish);
+      res.once("error", finish);
     });
 
     ws.on("error", (e) => {

@@ -7,9 +7,28 @@ import { wallet } from "./baw.js";
 import { notify, projectMessage } from "./telegram.js";
 
 let walletState = { connected: false, address: null, warnedAt: 0 };
+let offlineAlertAt = 0;
 
 export function setWalletState(s) {
   walletState = { ...walletState, ...s };
+}
+
+/** baw 会话失效类错误（掉线/未登录/服务端异常） */
+function isBawAuthError(msg) {
+  return /NOT_LOGGED_IN|10003000|System abnormality|UNAUTHORIZED|LOGGED_OUT/i.test(String(msg));
+}
+
+/** 会话失效：复位登录态 + 推送掉线告警（每 2 小时最多一次） */
+function noteBawOffline(reason) {
+  walletState.connected = false;
+  walletState.address = null;
+  walletState.lastProbeAt = 0;
+  const now = Date.now();
+  log.warn("minter", `baw 会话失效（${String(reason).slice(0, 120)}），等待重新扫码登录`);
+  if (now - offlineAlertAt > 2 * 3600_000) {
+    offlineAlertAt = now;
+    notify("🔐 <b>baw 钱包已掉线，自动 mint 暂停</b>\n请重新扫码登录（npm run signin / deploy/nas.py signin），登录后服务自动恢复，无需重启。");
+  }
 }
 
 async function hasContractCode(address) {
@@ -118,15 +137,7 @@ export async function handleEvent(event) {
   }
   if (!walletState.connected || !walletState.address) {
     store.recordAttempt(eventId, plan.contract, "wallet-unconnected");
-    const now = Date.now();
-    if (now - walletState.warnedAt > 6 * 3600_000) {
-      walletState.warnedAt = now;
-      notify(projectMessage({
-        plan,
-        action: "🔐 <b>发现可 mint 项目，但 baw 未登录</b>",
-        detail: "运行 npm run signin 扫码登录后即可自动 mint",
-      }));
-    }
+    noteBawOffline("懒检测未登录");
     return;
   }
 
@@ -173,6 +184,10 @@ export async function handleEvent(event) {
     try {
       exec = await tryMint(plan.inputData);
     } catch (firstErr) {
+      if (isBawAuthError(firstErr.message)) {
+        noteBawOffline(firstErr.message);
+        throw firstErr; // 掉线时不再浪费候选重试
+      }
       // 币安侧模拟拒绝：可能是发现者 calldata 带有特定参数/状态已变。试模拟通过的候选签名。
       const alt = await findMintCandidate(event, walletState.address);
       if (alt && alt.toLowerCase() !== String(plan.inputData).toLowerCase()) {
