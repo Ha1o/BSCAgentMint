@@ -5,7 +5,8 @@ import fs from "node:fs";
 import { store } from "./state.js";
 import { log } from "./logger.js";
 import { notify } from "./telegram.js";
-import { getWalletAddress } from "./minter.js";
+import { getWalletAddress, setWalletState } from "./minter.js";
+import { wallet } from "./baw.js";
 
 const DEFAULT_RPCS = "https://rpc-bsc.48.club,https://bsc.publicnode.com,https://1rpc.io/bnb";
 
@@ -18,8 +19,19 @@ let urlIdx = 0;
 let lastReqAt = 0;
 const MIN_GAP = 300;
 
-function walletLower() {
-  return (getWalletAddress() || "").toLowerCase();
+/** 主服务进程用内存态；独立进程（docker exec 测试）fallback 到 baw 会话文件 */
+async function resolveWallet() {
+  const mem = getWalletAddress();
+  if (mem) return String(mem).toLowerCase();
+  try {
+    const st = await wallet.status();
+    if (String(st).toUpperCase() === "CONNECTED") {
+      const addr = await wallet.address();
+      setWalletState({ connected: true, address: addr });
+      return String(addr).toLowerCase();
+    }
+  } catch {}
+  return "";
 }
 
 function postJson(url, body, timeoutMs = 15000) {
@@ -126,17 +138,21 @@ async function contractName(addr) {
 export async function scanValue() {
   const contracts = Object.entries(store.snapshot().mintedContracts || {});
   if (!contracts.length) return { scanned: 0, rows: [] };
-  const { latest, h6 } = await blockInfo();
-  const wallet = walletLower();
+  const wallet = await resolveWallet();
   if (!wallet) {
-    log.warn("nftvalue", "钱包地址未知，跳过扫描");
+    log.warn("nftvalue", "钱包地址未知（baw 未登录），跳过扫描");
     return { scanned: 0, rows: [] };
   }
+  const { latest, h6 } = await blockInfo();
   const rows = [];
-  const deadline0 = Date.now() + 20 * 60_000; // 全量总预算 20 分钟（62 合约 × ~15 请求，2 路并发）
-  const queue = contracts.slice();
+  const deadline0 = Date.now() + 40 * 60_000; // 全量总预算 40 分钟（NAS 出口约 60s/合约）
+  // 上次活跃的优先扫，其余随机洗牌（避免固定顺序导致部分合约永远扫不到）
+  const prev = store.snapshot().valuePrev || {};
+  const hot = contracts.filter(([c]) => (prev[c] || 0) > 0);
+  const rest = contracts.filter(([c]) => (prev[c] || 0) === 0).sort(() => Math.random() - 0.5);
+  const queue = [...hot, ...rest];
   const scanOne = async ([contract, meta]) => {
-    const deadline = Date.now() + 120_000;
+    const deadline = Date.now() + 150_000;
     const row = { contract, name: meta.name || "?", t6h: 0, addrs6h: 0, balance: null, delta: null, err: null };
     try {
       const act = await getLogsRange({ address: contract, topics: [TRANSFER] }, h6, latest, deadline);
@@ -154,7 +170,6 @@ export async function scanValue() {
       } catch {}
       row.name = (await contractName(contract)) || row.name;
       if (row.name && row.name !== "?") store.markMinted(contract, row.name);
-      const prev = store.snapshot().valuePrev || {};
       if (prev[contract] != null) row.delta = row.t6h - prev[contract];
     } catch (e) {
       row.err = String(e.message).slice(0, 60);
@@ -165,7 +180,7 @@ export async function scanValue() {
   async function worker() {
     while (queue.length) {
       if (Date.now() > deadline0) {
-        log.warn("nftvalue", "扫描总预算超 20 分钟，剩余合约明天再扫");
+        log.warn("nftvalue", `扫描总预算 40 分钟用尽，本轮覆盖 ${rows.length}/${contracts.length}，未扫的明晚优先`);
         return;
       }
       const e = queue.shift();
@@ -186,6 +201,7 @@ function bjHHMM(now = Date.now()) {
 
 /** 组装 HTML 报告 */
 export function buildValueText(rows) {
+  const total = Object.keys(store.snapshot().mintedContracts || {}).length;
   const hot = rows.filter((r) => !r.err && r.t6h >= 3).sort((a, b) => b.t6h - a.t6h);
   const warm = rows.filter((r) => !r.err && r.t6h >= 1 && r.t6h < 3).sort((a, b) => b.t6h - a.t6h);
   const dead = rows.filter((r) => !r.err && r.t6h === 0);
@@ -195,8 +211,9 @@ export function buildValueText(rows) {
     (r.balance != null ? `（在手 ${r.balance}）` : "") +
     (r.delta != null && r.delta !== 0 ? ` 环比${r.delta > 0 ? "+" : ""}${r.delta}` : "") +
     `\n  <a href="https://web3.okx.com/nft/collection/bsc/${r.contract}">OKX 页面</a> · bscscan: <a href="https://bscscan.com/token/${r.contract}">合约</a>`;
-  let text = `🌙 <b>NFT 价值日报</b>（北京时间 ${bjDay()} 21:00）\n扫描 minted 合约: ${rows.length}\n`;
-  text += `\n🔥 <b>高活跃（6h≥3 笔真实转让）</b>\n${hot.length ? hot.map(line).join("\n") : "（无）"}`;
+  let text = `🌙 <b>NFT 价值日报</b>（北京时间 ${bjDay()} 21:00）\n本轮扫描: ${rows.length}/${total}`;
+  if (rows.length < total) text += `（其余明晚轮扫）`;
+  text += `\n\n🔥 <b>高活跃（6h≥3 笔真实转让）</b>\n${hot.length ? hot.map(line).join("\n") : "（无）"}`;
   if (warm.length) text += `\n\n🟡 <b>低活跃（1-2 笔）</b>\n${warm.map(line).join("\n")}`;
   text += `\n\n💤 死盘: ${dead.length} 个（近 6h 零转让，建议持有不动）`;
   if (errs.length) text += `\n⚠️ 扫描失败: ${errs.length} 个（下晚重试）`;
