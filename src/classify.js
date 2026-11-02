@@ -14,9 +14,37 @@ const FORBIDDEN_SELECTORS = new Set(
   ].map((sig) => ethers.id(sig).slice(0, 10))
 );
 
+// CREATE2 部署工厂（mintgo 新项目由此部署 NFT 合约，discovery tx 即部署交易）
+const DEPLOY_FACTORY = "0x4e59b44847b379678b781793ed19c6b5ba922b6e";
+
 export function bnbToWei(bnb) {
   return BigInt(Math.round(Number(bnb) * 1e15)) * 1000n;
 }
+
+/** 部署型项目：扫描合约最近几分钟的真实 mint（Transfer from 0x0），原样复制他人成功的 mint calldata */
+async function replicaMintCalldata(contract, deadline) {
+  try {
+    const latest = await rpc.blockNumber();
+    const from = Math.max(1, latest - 2000); // ≈15 分钟窗口
+    const logs = await rpc.ethGetLogs({
+      address: contract,
+      topics: [TRANSFER, pad0, null],
+      fromBlock: "0x" + from.toString(16),
+      toBlock: "0x" + latest.toString(16),
+    });
+    // 取最新一笔 mint 交易
+    for (let i = logs.length - 1; i >= 0; i--) {
+      const tx = await rpc.getTx(logs[i].transactionHash).catch(() => null);
+      if (tx && tx.to && tx.to.toLowerCase() === contract && tx.input && tx.input !== "0x" && (tx.input.length - 2) / 2 < 2000) {
+        return { inputData: tx.input, value: BigInt(tx.value || 0) };
+      }
+    }
+  } catch {}
+  return null;
+}
+
+const pad0 = "0x" + "0".repeat(64);
+const TRANSFER = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
 
 /**
  * 用 functionName 生成候选签名，eth_call 以 value=0 模拟，返回一个能跑通的 calldata。
@@ -74,7 +102,17 @@ export async function buildMintPlan(event, walletAddress) {
     plan.inputData = tx.input && tx.input !== "0x" ? tx.input : null;
     plan.priceSource = "discovery-tx";
   } else if (tx) {
-    plan.note = "发现交易 to 与合约不一致（可能经由路由），退回事件字段判定";
+    const to = (tx.to || "").toLowerCase();
+    const inputLen = ((tx.input || "").length - 2) / 2;
+    if (to === DEPLOY_FACTORY || inputLen > 5000) {
+      // 部署型项目：discovery tx 是工厂部署合约（value 反映 mint 成本，免费平台为 0）
+      plan.valueWei = BigInt(tx.value || 0);
+      plan.priceSource = "deployer-tx";
+      plan.deployKind = true;
+      plan.note = "部署型项目（CREATE2 工厂），免费判定 + 复制他人 mint 调用";
+    } else {
+      plan.note = "发现交易 to 与合约不一致（可能经由路由），退回事件字段判定";
+    }
   }
 
   if (plan.valueWei === null) {
@@ -86,6 +124,16 @@ export async function buildMintPlan(event, walletAddress) {
       // 按发现者数量折算总花费（若 valueNative 本就是总额，这里只是保守高估）
       plan.valueWei = bnbToWei(Number(v) * (plan.qty || 1));
       plan.priceSource = "event-confirmed(per×qty)";
+    }
+  }
+
+  // 部署型项目：优先复制他人成功 mint 的 calldata（参数天然正确）
+  if (plan.deployKind && !plan.inputData && plan.valueWei === 0n) {
+    const replica = await replicaMintCalldata(plan.contract);
+    if (replica) {
+      plan.inputData = replica.inputData;
+      plan.valueWei = replica.value;
+      plan.priceSource = "deploy-tx+replica";
     }
   }
 

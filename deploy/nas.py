@@ -381,6 +381,15 @@ def testreport(cli):
     safe_print(run(cli, f'docker exec -w /app bscagentmint node -e "{code}"', timeout=1500))
 
 
+def rpcdiag(cli):
+    out = run(cli, "docker logs bscagentmint --since 10h 2>&1 | grep -a rpc | tail -6")
+    safe_print("== rpc errors ==")
+    safe_print(out)
+    for pat in ["价格未知", "kind=free", "kind=paid", "判定"]:
+        n = run(cli, f"docker logs bscagentmint --since 10h 2>&1 | grep -ac '{pat}' || true")
+        safe_print(f"{pat}: {n.strip()}")
+
+
 def restartsvc(cli):
     safe_print(run(cli, f"cd {REMOTE_DIR} && docker compose restart"))
 
@@ -422,6 +431,8 @@ if __name__ == "__main__":
             seedfile(cli)
         elif action == "testreport":
             testreport(cli)
+        elif action == "rpcdiag":
+            rpcdiag(cli)
         elif action == "loginstatus":
             loginstatus(cli)
             restartsvc(cli)

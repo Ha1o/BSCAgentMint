@@ -29,8 +29,9 @@ export const config = {
     telegramChatId: process.env.TELEGRAM_CHAT_ID || "",
   },
   rpc: {
+    // 默认节点避开 binance 官方系：其 CDN 对共享代理出口 IP 风控严格（403 HTML）
     urls: (process.env.BSC_RPC_URLS ||
-      "https://bsc-dataseed.binance.org,https://bsc-dataseed1.defibit.io")
+      "https://rpc-bsc.48.club,https://bsc.publicnode.com,https://1rpc.io/bnb,https://bsc-dataseed.binance.org")
       .split(",")
       .map((s) => s.trim())
       .filter(Boolean),
